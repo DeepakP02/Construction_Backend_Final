@@ -6,6 +6,12 @@ const User = require('../models/User');
 const Task = require('../models/Task');
 const Job = require('../models/Job');
 const mongoose = require('mongoose');
+const {
+    resolveCanonicalUserId,
+    getClusterUserIds,
+    isAliasUser,
+    resolveCanonicalContacts
+} = require('../services/chatIdentityService');
 
 const ADMIN_ROLES = ['COMPANY_OWNER', 'SUPER_ADMIN', 'ADMIN'];
 const HIERARCHY_RANKS = {
@@ -305,16 +311,8 @@ const getHierarchyUsers = async (req, res, next) => {
             }
         }
 
-        // Deduplicate strictly by unique user _id while preserving distinct accounts
-        const seenUserIds = new Set();
-        const uniqueAuthorizedUsers = [];
-        for (const u of authorizedUsers) {
-            const uidStr = String(u._id);
-            if (!seenUserIds.has(uidStr)) {
-                seenUserIds.add(uidStr);
-                uniqueAuthorizedUsers.push(u);
-            }
-        }
+        // Resolve canonical identities across verified duplicate clusters within company boundaries
+        const uniqueAuthorizedUsers = resolveCanonicalContacts(authorizedUsers, req.user.companyId);
 
         // Sort authorized users by hierarchy rank descending, then alphabetical
         uniqueAuthorizedUsers.sort((a, b) => {
@@ -352,7 +350,10 @@ const getOrCreateDirectRoom = async (req, res, next) => {
             return res.status(400).json({ message: 'Valid target user ID is required.' });
         }
 
-        const targetUser = await User.findById(targetUserId).lean();
+        // Authoritatively resolve target user ID to canonical user ID within company boundaries
+        const canonicalTargetId = resolveCanonicalUserId(targetUserId, req.user.companyId);
+
+        const targetUser = await User.findById(canonicalTargetId).lean();
         if (!targetUser) {
             return res.status(404).json({ message: 'Target user not found.' });
         }
@@ -362,13 +363,13 @@ const getOrCreateDirectRoom = async (req, res, next) => {
             return res.status(403).json({ message: check.reason });
         }
 
-        const pairKey = [String(req.user._id), String(targetUserId)].sort().join(':');
+        const pairKey = [String(req.user._id), String(canonicalTargetId)].sort().join(':');
 
         // Concurrency Lock: If already creating this direct pair in-flight, await the same promise
         if (inFlightDirectRoomPromises.has(pairKey)) {
             const room = await inFlightDirectRoomPromises.get(pairKey);
             const io = req.app?.get ? req.app.get('io') : null;
-            const isOnline = io ? (io.sockets.adapter.rooms.get(targetUserId.toString())?.size > 0) : false;
+            const isOnline = io ? (io.sockets.adapter.rooms.get(canonicalTargetId.toString())?.size > 0) : false;
             return res.status(200).json({
                 id: room._id,
                 _id: room._id,
@@ -383,7 +384,7 @@ const getOrCreateDirectRoom = async (req, res, next) => {
         }
 
         const creationPromise = (async () => {
-            // 1. Search by directPair key
+            // 1. Search by directPair key with canonical pair
             let room = await ChatRoom.findOne({
                 companyId: req.user.companyId,
                 roomType: 'DIRECT',
@@ -394,9 +395,10 @@ const getOrCreateDirectRoom = async (req, res, next) => {
             // 2. Fallback for historical rooms where metadata.directPair was not stamped
             if (!room) {
                 const u1 = new mongoose.Types.ObjectId(req.user._id);
-                const u2 = new mongoose.Types.ObjectId(targetUserId);
+                // Also search across any cluster IDs for historical backward compatibility
+                const clusterIds = getClusterUserIds(canonicalTargetId, req.user.companyId).map(id => new mongoose.Types.ObjectId(id));
                 const commonRooms = await ChatParticipant.aggregate([
-                    { $match: { userId: { $in: [u1, u2] } } },
+                    { $match: { userId: { $in: [u1, ...clusterIds] } } },
                     { $group: { _id: '$roomId', count: { $sum: 1 } } },
                     { $match: { count: 2 } }
                 ]);
@@ -582,7 +584,8 @@ const getChatRooms = async (req, res, next) => {
             if (room.roomType === 'PROJECT_GROUP') {
                 const pidStr = room.projectId ? String(room.projectId._id || room.projectId) : null;
                 const hasActiveAccess = pidStr && scope.projectIdSet.has(pidStr);
-                const validParticipants = participantsByRoomId.get(room._id.toString()) || [];
+                const rawParticipants = participantsByRoomId.get(room._id.toString()) || [];
+                const validParticipants = resolveCanonicalContacts(rawParticipants, req.user.companyId);
 
                 formattedRooms.push({
                     id: room._id,
@@ -608,7 +611,8 @@ const getChatRooms = async (req, res, next) => {
 
                 if (!otherP) continue;
 
-                const otherUser = await User.findById(otherP.userId).select('_id fullName role avatar isActive email').lean();
+                const canonicalOtherId = resolveCanonicalUserId(otherP.userId, req.user.companyId);
+                const otherUser = await User.findById(canonicalOtherId).select('_id fullName role avatar isActive email').lean();
                 if (!otherUser) continue;
 
                 // Dynamic permission check: is relationship still active?
@@ -838,7 +842,7 @@ const getRoomParticipants = async (req, res, next) => {
             }
         }
 
-        const participants = participantsDocs
+        const rawParticipants = participantsDocs
             .filter(p => {
                 if (!p.userId || p.userId.isActive === false) return false;
                 if (legitimateUserIds) {
@@ -853,6 +857,7 @@ const getRoomParticipants = async (req, res, next) => {
                     id: p._id,
                     participantId: p._id,
                     userId: u._id,
+                    _id: u._id,
                     fullName: u.fullName || 'User',
                     role: u.role || p.roleAtJoining || 'MEMBER',
                     avatar: u.avatar || null,
@@ -862,6 +867,8 @@ const getRoomParticipants = async (req, res, next) => {
                     joinedAt: p.createdAt
                 };
             });
+
+        const participants = resolveCanonicalContacts(rawParticipants, req.user.companyId);
 
         res.json({
             roomId: finalRoomId,

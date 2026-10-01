@@ -20,14 +20,18 @@ const HIERARCHY_RANKS = {
     'CLIENT': 0
 };
 
-// Recent message idempotency cache to prevent duplicate inserts on quick retries (TTL: 60s)
+// Recent message idempotency cache to prevent duplicate inserts on quick retries or concurrent clicks (TTL: 60s)
 const recentMessageIdempotencyMap = new Map();
-setInterval(() => {
+const dedupCleanupTimer = setInterval(() => {
     const cutoff = Date.now() - 60000;
-    for (const [key, timestamp] of recentMessageIdempotencyMap.entries()) {
-        if (timestamp < cutoff) recentMessageIdempotencyMap.delete(key);
+    for (const [key, entry] of recentMessageIdempotencyMap.entries()) {
+        const ts = entry?.timestamp || entry;
+        if (ts < cutoff) recentMessageIdempotencyMap.delete(key);
     }
 }, 30000);
+if (dedupCleanupTimer && typeof dedupCleanupTimer.unref === 'function') {
+    dedupCleanupTimer.unref();
+}
 
 /**
  * Dynamically resolves all active project IDs and names associated with a user
@@ -845,22 +849,44 @@ const getRoomParticipants = async (req, res, next) => {
 // @route   POST /api/chat
 // @access  Private
 const sendMessage = async (req, res, next) => {
+    let idempotencyKey = null;
+    let resolveInFlight = null;
+    let rejectInFlight = null;
     try {
         let { roomId, message, attachments, projectId, clientMsgId } = req.body;
         const { _id, companyId, role } = req.user;
 
-        // Idempotency check: if client sent clientMsgId, prevent duplicate insertion
-        if (clientMsgId) {
-            const idempotencyKey = `${_id}_${clientMsgId}`;
-            if (recentMessageIdempotencyMap.has(idempotencyKey)) {
-                const existing = await Chat.findOne({
-                    roomId,
-                    sender: _id,
-                    createdAt: { $gt: new Date(Date.now() - 60000) }
-                }).populate('sender', 'fullName role avatar').lean();
-                if (existing) return res.status(200).json(existing);
+        // Idempotency check: if client sent clientMsgId, or rapid duplicate submission within 1000ms
+        const cleanMsg = (message || '').trim();
+        idempotencyKey = clientMsgId 
+            ? `msg_${_id}_${clientMsgId}` 
+            : `dedup_${_id}_${roomId || projectId}_${cleanMsg}`;
+        
+        const cached = recentMessageIdempotencyMap.get(idempotencyKey);
+        if (cached) {
+            if (cached.result) {
+                return res.status(200).json(cached.result);
+            }
+            if (cached.promise) {
+                try {
+                    const resolved = await cached.promise;
+                    if (resolved) return res.status(200).json(resolved);
+                } catch (e) {
+                    // if previous in-flight failed, proceed with retry
+                }
             }
         }
+
+        // Set up in-flight promise tracker for concurrent requests
+        const inFlightPromise = new Promise((resolve, reject) => {
+            resolveInFlight = resolve;
+            rejectInFlight = reject;
+        });
+        recentMessageIdempotencyMap.set(idempotencyKey, {
+            timestamp: Date.now(),
+            promise: inFlightPromise,
+            result: null
+        });
 
         // Smart project ID resolution
         if (roomId && !projectId && mongoose.Types.ObjectId.isValid(roomId)) {
@@ -951,10 +977,6 @@ const sendMessage = async (req, res, next) => {
             attachments: attachments || []
         });
 
-        if (clientMsgId) {
-            recentMessageIdempotencyMap.set(`${_id}_${clientMsgId}`, Date.now());
-        }
-
         const fullChat = {
             ...chat.toObject(),
             clientMsgId: clientMsgId || undefined,
@@ -965,6 +987,15 @@ const sendMessage = async (req, res, next) => {
                 avatar: req.user.avatar
             }
         };
+
+        if (idempotencyKey) {
+            recentMessageIdempotencyMap.set(idempotencyKey, {
+                timestamp: Date.now(),
+                result: fullChat,
+                promise: null
+            });
+        }
+        if (resolveInFlight) resolveInFlight(fullChat);
 
         const io = req.app.get('io');
         if (io) {
@@ -1026,6 +1057,10 @@ const sendMessage = async (req, res, next) => {
 
         res.status(201).json(fullChat);
     } catch (error) {
+        if (idempotencyKey) {
+            recentMessageIdempotencyMap.delete(idempotencyKey);
+        }
+        if (rejectInFlight) rejectInFlight(error);
         next(error);
     }
 };

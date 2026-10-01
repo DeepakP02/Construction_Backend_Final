@@ -305,16 +305,27 @@ const getHierarchyUsers = async (req, res, next) => {
             }
         }
 
+        // Deduplicate strictly by unique user _id while preserving distinct accounts
+        const seenUserIds = new Set();
+        const uniqueAuthorizedUsers = [];
+        for (const u of authorizedUsers) {
+            const uidStr = String(u._id);
+            if (!seenUserIds.has(uidStr)) {
+                seenUserIds.add(uidStr);
+                uniqueAuthorizedUsers.push(u);
+            }
+        }
+
         // Sort authorized users by hierarchy rank descending, then alphabetical
-        authorizedUsers.sort((a, b) => {
+        uniqueAuthorizedUsers.sort((a, b) => {
             const rankDiff = (HIERARCHY_RANKS[b.role] || 0) - (HIERARCHY_RANKS[a.role] || 0);
             if (rankDiff !== 0) return rankDiff;
             return a.fullName.localeCompare(b.fullName);
         });
 
-        const total = authorizedUsers.length;
+        const total = uniqueAuthorizedUsers.length;
         const startIndex = (pageNum - 1) * limitNum;
-        const paginatedUsers = authorizedUsers.slice(startIndex, startIndex + limitNum);
+        const paginatedUsers = uniqueAuthorizedUsers.slice(startIndex, startIndex + limitNum);
 
         res.json({
             users: paginatedUsers,
@@ -597,7 +608,7 @@ const getChatRooms = async (req, res, next) => {
 
                 if (!otherP) continue;
 
-                const otherUser = await User.findById(otherP.userId).select('_id fullName role avatar isActive').lean();
+                const otherUser = await User.findById(otherP.userId).select('_id fullName role avatar isActive email').lean();
                 if (!otherUser) continue;
 
                 // Dynamic permission check: is relationship still active?
@@ -613,6 +624,16 @@ const getChatRooms = async (req, res, next) => {
                     avatar: otherUser.avatar || null,
                     otherUserId: otherUser._id,
                     otherRole: otherUser.role,
+                    email: otherUser.email || null,
+                    otherUser: {
+                        _id: otherUser._id,
+                        id: otherUser._id,
+                        fullName: otherUser.fullName,
+                        email: otherUser.email || null,
+                        role: otherUser.role,
+                        avatar: otherUser.avatar || null,
+                        isOnline: !!isOnline
+                    },
                     isOnline: !!isOnline,
                     sharedProjects: check.sharedProjectNames || [],
                     unreadCount,

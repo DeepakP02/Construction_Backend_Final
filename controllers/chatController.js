@@ -603,17 +603,69 @@ const getChatRooms = async (req, res, next) => {
                     participantCount: validParticipants.length
                 });
             } else if (room.roomType === 'DIRECT') {
-                // Find other participant
-                const otherP = await ChatParticipant.findOne({
-                    roomId: room._id,
-                    userId: { $ne: userIdObj }
-                }).lean();
+                // 1. Fetch room participants to verify membership and participant count
+                const allRoomParticipants = await ChatParticipant.find({ roomId: room._id }).populate('userId', 'fullName role avatar isActive email companyId').lean();
+                const isAuthorizedParticipant = allRoomParticipants.some(p => p.userId && String(p.userId._id || p.userId) === String(userIdObj));
+                if (!isAuthorizedParticipant) continue;
 
-                if (!otherP) continue;
+                // 2. Resolve intended peer from metadata.directPair if present and valid
+                let targetPeerId = null;
+                let isPairMember = false;
+                const directPairStr = (room.metadata instanceof Map ? room.metadata.get('directPair') : room.metadata?.directPair);
 
-                const canonicalOtherId = resolveCanonicalUserId(otherP.userId, req.user.companyId);
-                const otherUser = await User.findById(canonicalOtherId).select('_id fullName role avatar isActive email').lean();
+                if (typeof directPairStr === 'string' && directPairStr.includes(':')) {
+                    const rawPairIds = directPairStr.split(':').map(s => s.trim());
+                    // Validate metadata.directPair contains exactly two valid user IDs
+                    if (rawPairIds.length === 2 && mongoose.Types.ObjectId.isValid(rawPairIds[0]) && mongoose.Types.ObjectId.isValid(rawPairIds[1])) {
+                        const currentUserIdStr = String(req.user._id);
+                        const canonicalCurrentUserId = resolveCanonicalUserId(currentUserIdStr, req.user.companyId);
+                        const canon0 = resolveCanonicalUserId(rawPairIds[0], req.user.companyId);
+                        const canon1 = resolveCanonicalUserId(rawPairIds[1], req.user.companyId);
+
+                        const isMember0 = (rawPairIds[0] === currentUserIdStr || canon0 === canonicalCurrentUserId);
+                        const isMember1 = (rawPairIds[1] === currentUserIdStr || canon1 === canonicalCurrentUserId);
+
+                        if (isMember0) {
+                            targetPeerId = rawPairIds[1];
+                            isPairMember = true;
+                        } else if (isMember1) {
+                            targetPeerId = rawPairIds[0];
+                            isPairMember = true;
+                        }
+                    }
+                }
+
+                // 3. Backward-compatible fallback for legacy rooms without directPair or participants outside directPair
+                if (!targetPeerId) {
+                    const otherP = allRoomParticipants.find(p => p.userId && String(p.userId._id || p.userId) !== String(userIdObj));
+                    if (otherP?.userId) {
+                        targetPeerId = otherP.userId._id || otherP.userId;
+                    }
+                }
+
+                if (!targetPeerId) continue;
+
+                // 4. Resolve canonical identity of peer (aliases -> canonical account)
+                const canonicalOtherId = resolveCanonicalUserId(targetPeerId, req.user.companyId);
+                const otherUser = await User.findById(canonicalOtherId).select('_id fullName role avatar isActive email companyId').lean();
                 if (!otherUser) continue;
+
+                // 5. Tenant isolation check: ensure peer belongs to same company
+                if (String(otherUser.companyId) !== String(req.user.companyId)) continue;
+
+                // 6. Handle multi-party legacy direct rooms (e.g. legacy Site Foreman participant)
+                // If more than 2 participants exist and viewing user is not an intended directPair member,
+                // present the room transparently as a legacy multi-party thread rather than a normal 1-on-1
+                let roomDisplayName = otherUser.fullName;
+                const isMultiPartyLegacy = allRoomParticipants.length > 2;
+
+                if (isMultiPartyLegacy && !isPairMember) {
+                    const peerNames = allRoomParticipants
+                        .filter(p => p.userId && String(p.userId._id || p.userId) !== String(userIdObj))
+                        .map(p => p.userId.fullName || 'User')
+                        .join(' & ');
+                    roomDisplayName = peerNames ? `${peerNames} (Legacy Discussion)` : `${otherUser.fullName} (Legacy Discussion)`;
+                }
 
                 // Dynamic permission check: is relationship still active?
                 const check = await assertHierarchyMessagingAllowed(req.user, otherUser, scope);
@@ -624,7 +676,9 @@ const getChatRooms = async (req, res, next) => {
                     _id: room._id,
                     roomType: 'DIRECT',
                     isGroup: false,
-                    name: otherUser.fullName,
+                    isMultiParty: isMultiPartyLegacy,
+                    participantCount: allRoomParticipants.length,
+                    name: roomDisplayName,
                     avatar: otherUser.avatar || null,
                     otherUserId: otherUser._id,
                     otherRole: otherUser.role,

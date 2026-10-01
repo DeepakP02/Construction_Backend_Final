@@ -504,21 +504,12 @@ const getOrCreateDirectRoom = async (req, res, next) => {
 const getChatRooms = async (req, res, next) => {
     try {
         const { _id, companyId } = req.user;
+        const io = req.app ? req.app.get('io') : null;
         const scope = await getUserProjectScope(_id, companyId, req.user.role);
-        const userIdObj = new mongoose.Types.ObjectId(_id);
-        const io = req.app.get('io');
+        const clusterUserIds = getClusterUserIds(_id, companyId);
+        const clusterUserObjIds = clusterUserIds.map(id => new mongoose.Types.ObjectId(id));
 
-        // Automatically ensure PROJECT_GROUP rooms exist for all authorized projects
-        for (const pid of scope.projectIdSet) {
-            if (mongoose.Types.ObjectId.isValid(pid)) {
-                const roomExists = await ChatRoom.exists({ projectId: pid, roomType: 'PROJECT_GROUP' });
-                if (!roomExists) {
-                    await syncProjectParticipants(pid);
-                }
-            }
-        }
-
-        const participants = await ChatParticipant.find({ userId: userIdObj }).lean();
+        const participants = await ChatParticipant.find({ userId: { $in: clusterUserObjIds } }).lean();
         const roomIds = participants.map(p => p.roomId);
 
         const roomsData = await ChatRoom.find({
@@ -556,14 +547,17 @@ const getChatRooms = async (req, res, next) => {
         const formattedRooms = [];
 
         for (const room of roomsData) {
-            const participantRecord = participants.find(p => String(p.roomId) === String(room._id));
-            const lastRead = participantRecord?.lastReadAt || new Date(0);
+            const participantRecords = participants.filter(p => String(p.roomId) === String(room._id));
+            const lastRead = participantRecords.reduce((maxTime, p) => {
+                const t = p.lastReadAt ? new Date(p.lastReadAt).getTime() : 0;
+                return t > maxTime ? t : maxTime;
+            }, 0);
 
-            // Fetch unread count
+            // Fetch unread count excluding any message sent by current user's cluster IDs
             const unreadCount = await Chat.countDocuments({
                 roomId: room._id,
-                sender: { $ne: userIdObj },
-                createdAt: { $gt: lastRead }
+                sender: { $nin: clusterUserObjIds },
+                createdAt: { $gt: new Date(lastRead) }
             });
 
             // Fetch latest message
@@ -605,7 +599,7 @@ const getChatRooms = async (req, res, next) => {
             } else if (room.roomType === 'DIRECT') {
                 // 1. Fetch room participants to verify membership and participant count
                 const allRoomParticipants = await ChatParticipant.find({ roomId: room._id }).populate('userId', 'fullName role avatar isActive email companyId').lean();
-                const isAuthorizedParticipant = allRoomParticipants.some(p => p.userId && String(p.userId._id || p.userId) === String(userIdObj));
+                const isAuthorizedParticipant = allRoomParticipants.some(p => p.userId && clusterUserIds.includes(String(p.userId._id || p.userId)));
                 if (!isAuthorizedParticipant) continue;
 
                 // 2. Resolve intended peer from metadata.directPair if present and valid
@@ -637,7 +631,7 @@ const getChatRooms = async (req, res, next) => {
 
                 // 3. Backward-compatible fallback for legacy rooms without directPair or participants outside directPair
                 if (!targetPeerId) {
-                    const otherP = allRoomParticipants.find(p => p.userId && String(p.userId._id || p.userId) !== String(userIdObj));
+                    const otherP = allRoomParticipants.find(p => p.userId && !clusterUserIds.includes(String(p.userId._id || p.userId)));
                     if (otherP?.userId) {
                         targetPeerId = otherP.userId._id || otherP.userId;
                     }
@@ -661,7 +655,7 @@ const getChatRooms = async (req, res, next) => {
 
                 if (isMultiPartyLegacy && !isPairMember) {
                     const peerNames = allRoomParticipants
-                        .filter(p => p.userId && String(p.userId._id || p.userId) !== String(userIdObj))
+                        .filter(p => p.userId && !clusterUserIds.includes(String(p.userId._id || p.userId)))
                         .map(p => p.userId.fullName || 'User')
                         .join(' & ');
                     roomDisplayName = peerNames ? `${peerNames} (Legacy Discussion)` : `${otherUser.fullName} (Legacy Discussion)`;
@@ -1161,28 +1155,29 @@ const sendMessage = async (req, res, next) => {
 const markAsRead = async (req, res, next) => {
     try {
         const { roomId } = req.params;
-        const { _id } = req.user;
+        const { _id, companyId } = req.user;
 
         if (!mongoose.Types.ObjectId.isValid(roomId)) {
             return res.status(400).json({ message: 'Invalid Room ID' });
         }
 
-        const participant = await ChatParticipant.findOneAndUpdate(
-            { roomId, userId: _id },
-            { lastReadAt: new Date() },
-            { new: true }
-        );
+        const clusterUserIds = getClusterUserIds(_id, companyId);
+        const clusterUserObjIds = clusterUserIds.map(id => new mongoose.Types.ObjectId(id));
+        const now = new Date();
 
-        if (!participant) {
-            return res.status(404).json({ message: 'Participant record not found' });
-        }
+        await ChatParticipant.updateMany(
+            { roomId, userId: { $in: clusterUserObjIds } },
+            { $set: { lastReadAt: now } }
+        );
 
         const io = req.app.get('io');
         if (io) {
-            io.to(_id.toString()).emit('unread_count_updated');
+            clusterUserIds.forEach(uId => {
+                io.to(uId).emit('unread_count_updated');
+            });
         }
 
-        res.json({ success: true, lastReadAt: participant.lastReadAt });
+        res.json({ success: true, lastReadAt: now });
     } catch (error) {
         next(error);
     }
@@ -1193,31 +1188,54 @@ const markAsRead = async (req, res, next) => {
 // @access  Private
 const getUnreadCount = async (req, res, next) => {
     try {
-        const { _id } = req.user;
-        const userIdObj = new mongoose.Types.ObjectId(_id);
+        const { _id, companyId } = req.user;
+        const clusterUserIds = getClusterUserIds(_id, companyId);
+        const clusterUserObjIds = clusterUserIds.map(id => new mongoose.Types.ObjectId(id));
 
-        const participants = await ChatParticipant.find({ userId: userIdObj }).lean();
+        const participants = await ChatParticipant.find({ userId: { $in: clusterUserObjIds } }).lean();
         const roomIds = participants.map(p => p.roomId);
 
-        const rooms = await ChatRoom.find({ _id: { $in: roomIds }, isActive: { $ne: false } }).select('_id roomType').lean();
-        const roomTypeMap = new Map(rooms.map(r => [String(r._id), r.roomType]));
+        const rooms = await ChatRoom.find({ _id: { $in: roomIds }, isActive: { $ne: false } }).select('_id roomType metadata').lean();
+        const roomsMap = new Map(rooms.map(r => [String(r._id), r]));
+
+        // Deduplicate room read states by selecting max lastReadAt per roomId
+        const lastReadByRoomId = new Map();
+        for (const p of participants) {
+            const rIdStr = String(p.roomId);
+            const t = p.lastReadAt ? new Date(p.lastReadAt).getTime() : 0;
+            if (!lastReadByRoomId.has(rIdStr) || t > lastReadByRoomId.get(rIdStr)) {
+                lastReadByRoomId.set(rIdStr, t);
+            }
+        }
 
         let groupUnread = 0;
         let privateUnread = 0;
 
-        for (const p of participants) {
-            const rType = roomTypeMap.get(String(p.roomId));
-            if (!rType) continue;
+        for (const [rIdStr, lastReadTime] of lastReadByRoomId.entries()) {
+            const room = roomsMap.get(rIdStr);
+            if (!room) continue;
+
+            if (room.roomType === 'DIRECT') {
+                // Ensure target peer in direct room is active and belongs to same company
+                const allRoomParticipants = await ChatParticipant.find({ roomId: room._id }).populate('userId', '_id companyId isActive').lean();
+                const otherP = allRoomParticipants.find(p => p.userId && !clusterUserIds.includes(String(p.userId._id || p.userId)));
+                if (!otherP || !otherP.userId) continue;
+
+                const canonicalOtherId = resolveCanonicalUserId(otherP.userId._id || otherP.userId, companyId);
+                const otherUser = await User.findById(canonicalOtherId).select('_id companyId isActive').lean();
+                if (!otherUser || otherUser.isActive === false) continue;
+                if (String(otherUser.companyId) !== String(companyId)) continue;
+            }
 
             const count = await Chat.countDocuments({
-                roomId: p.roomId,
-                sender: { $ne: userIdObj },
-                createdAt: { $gt: p.lastReadAt || new Date(0) }
+                roomId: room._id,
+                sender: { $nin: clusterUserObjIds },
+                createdAt: { $gt: new Date(lastReadTime) }
             });
 
-            if (rType === 'PROJECT_GROUP') {
+            if (room.roomType === 'PROJECT_GROUP') {
                 groupUnread += count;
-            } else if (rType === 'DIRECT') {
+            } else if (room.roomType === 'DIRECT') {
                 privateUnread += count;
             }
         }

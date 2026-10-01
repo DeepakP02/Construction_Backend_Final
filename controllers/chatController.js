@@ -262,7 +262,7 @@ const getHierarchyUsers = async (req, res, next) => {
 
         const candidateFilter = {
             companyId: req.user.companyId,
-            isActive: true,
+            isActive: { $ne: false },
             _id: { $ne: req.user._id }
         };
 
@@ -272,12 +272,13 @@ const getHierarchyUsers = async (req, res, next) => {
             candidateFilter.$or = [
                 { fullName: regex },
                 { email: regex },
-                { phone: regex }
+                { phone: regex },
+                { role: regex }
             ];
         }
 
         const candidates = await User.find(candidateFilter)
-            .select('_id fullName email role avatar phone')
+            .select('_id fullName email role avatar phone companyId isActive')
             .lean();
 
         const authorizedUsers = [];
@@ -296,7 +297,8 @@ const getHierarchyUsers = async (req, res, next) => {
                     fullName: candidate.fullName,
                     role: candidate.role,
                     avatar: candidate.avatar || null,
-                    email: candidate.email,
+                    email: candidate.email || null,
+                    phone: candidate.phone || null,
                     sharedProjects: check.sharedProjectNames || [],
                     isOnline: !!isOnline
                 });
@@ -640,6 +642,11 @@ const getChatRooms = async (req, res, next) => {
 const getRoomMessages = async (req, res, next) => {
     try {
         const { roomId } = req.params;
+        if (roomId === 'hierarchy-users') return getHierarchyUsers(req, res, next);
+        if (roomId === 'rooms') return getChatRooms(req, res, next);
+        if (roomId === 'unread-count') return getUnreadCount(req, res, next);
+        if (roomId === 'users') return getChatUsers(req, res, next);
+
         const { _id, companyId, role } = req.user;
 
         let finalRoomId = roomId;
@@ -754,7 +761,7 @@ const getRoomParticipants = async (req, res, next) => {
         }
 
         const participantsDocs = await ChatParticipant.find({ roomId: finalRoomId })
-            .populate('userId', 'fullName role avatar email isActive')
+            .populate('userId', 'fullName role avatar email phone isActive')
             .sort({ createdAt: 1 })
             .lean();
 
@@ -829,6 +836,7 @@ const getRoomParticipants = async (req, res, next) => {
                     role: u.role || p.roleAtJoining || 'MEMBER',
                     avatar: u.avatar || null,
                     email: u.email || null,
+                    phone: u.phone || null,
                     isOnline: !!isOnline,
                     joinedAt: p.createdAt
                 };

@@ -1047,8 +1047,7 @@ const sendMessage = async (req, res, next) => {
                 }
             }
         } else {
-            participant.lastReadAt = new Date();
-            await participant.save();
+            ChatParticipant.updateOne({ _id: participant._id }, { lastReadAt: new Date() }).catch(() => {});
         }
 
         // Create Message

@@ -111,6 +111,15 @@ async function getUserProjectScope(userId, companyId, role) {
 }
 
 /**
+ * Helper to get user chat scope object from user request object
+ */
+async function getUserChatScope(userObj) {
+    if (!userObj) return { isAdmin: false, projectIdSet: new Set(), projectNamesMap: new Map() };
+    const { _id, companyId, role } = userObj;
+    return await getUserProjectScope(_id, companyId, role);
+}
+
+/**
  * Validates role-to-role and project-scoped hierarchy rules
  * Server-authoritative permission resolver
  */
@@ -1372,5 +1381,6 @@ module.exports = {
     updateMessageAttachments,
     syncProjectParticipants,
     getUserProjectScope,
+    getUserChatScope,
     assertHierarchyMessagingAllowed
 };
